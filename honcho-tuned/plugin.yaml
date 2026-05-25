@@ -1,0 +1,7 @@
+name: honcho-tuned
+version: 1.0.0
+description: "Honcho memory plugin (apnex fork) with deterministic distillation injection and configurable dialectic prompts. Implements Tier 1 + 3a of the honcho-reasoning-engagement proposal."
+pip_dependencies:
+  - honcho-ai
+hooks:
+  - on_session_end
