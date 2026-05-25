@@ -321,6 +321,29 @@ class HonchoClientConfig:
     # block exists or enabled was set explicitly), vs auto-enabled from a
     # stray HONCHO_API_KEY env var.
     explicitly_configured: bool = False
+    # ----- Tier 1 (honcho-tuned v1.0.0): deterministic distillation block ---
+    # When True, fetch deductive/inductive/contradiction conclusions before
+    # each turn and render them as a <distillations> XML block at the top of
+    # <memory-context>.  Symmetric: emits one block per peer-perspective
+    # (user-as-observer-of-self, hermes-as-observer-of-user).
+    distillation_enabled: bool = True
+    # Maximum conclusions per level for the user peer's self-observations.
+    distillation_max_per_level_user: int = 10
+    # Maximum conclusions per level for hermes-observing-user (the AI block).
+    distillation_max_per_level_ai: int = 10
+    # Maximum contradictions per peer block (never trimmed by budget policy).
+    distillation_max_contradictions: int = 5
+    # Maximum deductive conclusions per peer block.
+    distillation_max_deductive: int = 5
+    # ----- Tier 3a (honcho-tuned v1.0.0): client-side query templating ------
+    # Templates applied to the user query before it's sent to peer.chat().
+    # Substitution tokens: {query} and {peer}.  Keys must match Honcho
+    # reasoning levels: minimal, low, medium, high, max.  A separate
+    # ``default`` key is the fallback used when no level template matches.
+    # Empty dict ⇒ pass-through (no templating).  Honcho's server-side
+    # dialectic system prompt is NOT affected — see plan §P2.3 / Tier 3a
+    # for why server-side overrides require a Honcho-server fork.
+    dialectic_prompts: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
     def from_env(
@@ -542,6 +565,38 @@ class HonchoClientConfig:
             sessions=raw.get("sessions", {}),
             raw=raw,
             explicitly_configured=_explicitly_configured,
+            # ----- Tier 1 (honcho-tuned v1.0.0): distillation block ----------
+            distillation_enabled=_resolve_bool(
+                (host_block.get("distillation") or {}).get("enabled"),
+                (raw.get("distillation") or {}).get("enabled"),
+                default=True,
+            ),
+            distillation_max_per_level_user=_parse_int_config(
+                (host_block.get("distillation") or {}).get("maxPerLevelUser"),
+                (raw.get("distillation") or {}).get("maxPerLevelUser"),
+                default=10,
+            ),
+            distillation_max_per_level_ai=_parse_int_config(
+                (host_block.get("distillation") or {}).get("maxPerLevelAi"),
+                (raw.get("distillation") or {}).get("maxPerLevelAi"),
+                default=10,
+            ),
+            distillation_max_contradictions=_parse_int_config(
+                (host_block.get("distillation") or {}).get("maxContradictions"),
+                (raw.get("distillation") or {}).get("maxContradictions"),
+                default=5,
+            ),
+            distillation_max_deductive=_parse_int_config(
+                (host_block.get("distillation") or {}).get("maxDeductive"),
+                (raw.get("distillation") or {}).get("maxDeductive"),
+                default=5,
+            ),
+            # ----- Tier 3a (honcho-tuned v1.0.0): client-side templating -----
+            dialectic_prompts=(
+                host_block.get("dialecticPrompts")
+                or raw.get("dialecticPrompts")
+                or {}
+            ),
         )
 
     @staticmethod
@@ -781,3 +836,121 @@ def reset_honcho_client() -> None:
     """Reset the Honcho client singleton (useful for testing)."""
     global _honcho_client
     _honcho_client = None
+
+
+# ---------------------------------------------------------------------------
+# Tier 1 — Distillation fetch (honcho-tuned v1.0.0)
+# ---------------------------------------------------------------------------
+#
+# Queries Honcho's conclusions/list endpoint for distilled observations
+# grouped by reasoning level (deductive, inductive, contradiction).  Used by
+# the session manager to build a deterministic <distillations> block at the
+# top of <memory-context> before each turn.
+#
+# Implementation note: the SDK's ``peer.conclusions.list()`` doesn't expose a
+# ``level`` filter, so we issue raw POSTs against the same endpoint via the
+# client's internal HTTP transport.  This shares auth/baseUrl/timeout config
+# with the rest of the plugin.  The endpoint and filter shape were verified
+# against /app/src/routers/conclusions.py on the live Honcho server
+# (apnex/honcho fork, P2.0 recon 2026-05-25):
+#   POST /v1/workspaces/{ws}/conclusions/list
+#   body  : {"filters": {"observer": <pid>, "observed": <pid>, "level": "<L>"}}
+#   query : {"size": <cap>, "page": 1}
+#   resp  : Page[Conclusion] — items have id, content, observer_id,
+#           observed_id, session_id, created_at.
+#
+# Style note: the plan template showed this as ``async def`` against an
+# httpx client, but the honcho-tuned plugin is fully synchronous (uses
+# threads, not asyncio).  Keeping this sync for consistency; callers that
+# need parallelism wrap in a thread the same way prefetch_context() does.
+
+
+_DOC_LEVELS = ("contradiction", "deductive", "inductive")
+
+
+def fetch_distillations(
+    honcho_client: Any,
+    workspace_id: str,
+    observer: str,
+    observed: str,
+    *,
+    max_deductive: int = 5,
+    max_inductive: int = 10,
+    max_contradictions: int = 5,
+) -> dict[str, list[dict[str, Any]]]:
+    """Fetch distilled observations grouped by reasoning level.
+
+    POSTs to /v1/workspaces/{ws}/conclusions/list three times (once per
+    level) with filters={observer, observed, level} and size=<cap>.
+
+    Args:
+        honcho_client: A live ``honcho.Honcho`` client (provides ``_http``).
+        workspace_id: Honcho workspace ID.
+        observer: peer ID that authored the observations.
+        observed: peer ID the observations are about.
+        max_deductive: cap for deductive items (default 5).
+        max_inductive: cap for inductive items (default 10).
+        max_contradictions: cap for contradiction items (default 5).
+
+    Returns:
+        Dict with keys "contradictions", "deductive", "inductive".  Each
+        value is a list of dicts ``{"id", "content", "created_at"}`` in
+        newest-first order (server default reverse=false).  Returns empty
+        lists on per-level failures so a single bad level doesn't poison
+        the whole block.
+    """
+    from honcho.http import routes
+
+    out: dict[str, list[dict[str, Any]]] = {
+        "contradictions": [],
+        "deductive": [],
+        "inductive": [],
+    }
+    caps = {
+        "contradiction": max_contradictions,
+        "deductive": max_deductive,
+        "inductive": max_inductive,
+    }
+    out_key = {
+        "contradiction": "contradictions",
+        "deductive": "deductive",
+        "inductive": "inductive",
+    }
+
+    http = getattr(honcho_client, "_http", None)
+    if http is None:
+        logger.debug("fetch_distillations: client has no _http attribute")
+        return out
+
+    route = routes.conclusions_list(workspace_id)
+
+    for level in _DOC_LEVELS:
+        cap = max(0, int(caps[level]))
+        if cap == 0:
+            continue
+        try:
+            body = {
+                "filters": {
+                    "observer": observer,
+                    "observed": observed,
+                    "level": level,
+                }
+            }
+            data = http.post(route, body=body, query={"page": 1, "size": cap})
+            items = (data or {}).get("items") or []
+            out[out_key[level]] = [
+                {
+                    "id": item.get("id"),
+                    "content": item.get("content") or "",
+                    "created_at": item.get("created_at"),
+                }
+                for item in items
+                if (item.get("content") or "").strip()
+            ]
+        except Exception as e:  # pragma: no cover — logged & swallowed
+            logger.debug(
+                "fetch_distillations: level=%s observer=%s observed=%s failed: %s",
+                level, observer, observed, e,
+            )
+
+    return out

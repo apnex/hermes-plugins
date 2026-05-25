@@ -10,7 +10,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, TYPE_CHECKING
 
-from plugins.memory.honcho.client import get_honcho_client
+from .client import get_honcho_client
 
 if TYPE_CHECKING:
     from honcho import Honcho
@@ -132,6 +132,29 @@ class HonchoSessionManager:
         )
         self._dialectic_max_input_chars: int = (
             config.dialectic_max_input_chars if config else 10000
+        )
+
+        # ----- Tier 1 (honcho-tuned v1.0.0): distillation config ------------
+        # Pulled directly from HonchoClientConfig — see client.py for keys.
+        self._distillation_enabled: bool = (
+            config.distillation_enabled if config else True
+        )
+        self._distillation_max_per_level_user: int = (
+            config.distillation_max_per_level_user if config else 10
+        )
+        self._distillation_max_per_level_ai: int = (
+            config.distillation_max_per_level_ai if config else 10
+        )
+        self._distillation_max_contradictions: int = (
+            config.distillation_max_contradictions if config else 5
+        )
+        self._distillation_max_deductive: int = (
+            config.distillation_max_deductive if config else 5
+        )
+        # ----- Tier 3a (honcho-tuned v1.0.0): dialectic prompt templates ----
+        # Shape: {"default": "...", "reasoning_levels": {"minimal": "...", ...}}
+        self._dialectic_prompts: dict[str, Any] = (
+            dict(config.dialectic_prompts) if (config and config.dialectic_prompts) else {}
         )
 
         # Async write queue — started lazily on first enqueue
@@ -525,6 +548,155 @@ class HonchoSessionManager:
         """Return the configured default reasoning level."""
         return self._dialectic_reasoning_level
 
+    # ------------------------------------------------------------------ #
+    # Tier 3a (honcho-tuned v1.0.0): client-side query templating
+    # ------------------------------------------------------------------ #
+    def _apply_dialectic_template(
+        self,
+        query: str,
+        *,
+        level: str | None = None,
+        peer: str = "user",
+    ) -> str:
+        """Wrap ``query`` with the configured dialectic prompt template.
+
+        Resolution order:
+          1. ``reasoning_levels[<level>]`` — level-specific template.
+          2. ``default`` — universal fallback template.
+          3. Raw query — pass-through when no templates are configured.
+
+        Substitution tokens: ``{query}`` (the raw user question) and
+        ``{peer}`` (the target peer alias, typically "user" or "ai").
+
+        Never raises — on any template formatting error (missing key,
+        unbalanced braces, non-string template), falls back to the raw
+        query so a bad config can't break dialectic queries.
+        """
+        templates = self._dialectic_prompts or {}
+        if not templates:
+            return query
+
+        chosen: str | None = None
+        try:
+            levels = templates.get("reasoning_levels") or {}
+            if isinstance(levels, dict) and level:
+                lvl_tmpl = levels.get(level)
+                if isinstance(lvl_tmpl, str) and lvl_tmpl.strip():
+                    chosen = lvl_tmpl
+            if chosen is None:
+                default_tmpl = templates.get("default")
+                if isinstance(default_tmpl, str) and default_tmpl.strip():
+                    chosen = default_tmpl
+        except Exception as e:
+            logger.debug("dialectic template lookup failed: %s", e)
+            return query
+
+        if not chosen:
+            return query
+
+        try:
+            return chosen.format(query=query, peer=peer)
+        except Exception as e:
+            logger.debug("dialectic template format failed (template=%r): %s", chosen, e)
+            return query
+
+    # ------------------------------------------------------------------ #
+    # Tier 1 (honcho-tuned v1.0.0): distillation fetch + render
+    # ------------------------------------------------------------------ #
+    def fetch_distillations_for_peer(
+        self,
+        session_key: str,
+        peer_label: str,
+    ) -> dict[str, list[dict[str, Any]]]:
+        """Fetch distillation conclusions for one peer-perspective.
+
+        ``peer_label`` controls the observer/observed pairing:
+          * ``"user"``   → observer=user_peer,  observed=user_peer
+                          (user's self-observations — Q1 user block)
+          * ``"hermes"`` → observer=hermes_peer, observed=user_peer
+                          (hermes-observing-user — Q1 symmetric AI block)
+
+        Returns an empty {contradictions, deductive, inductive} dict when
+        the session is missing, distillation is disabled, or the fetch
+        fails entirely.
+        """
+        empty: dict[str, list[dict[str, Any]]] = {
+            "contradictions": [], "deductive": [], "inductive": [],
+        }
+        if not self._distillation_enabled:
+            return empty
+        session = self._cache.get(session_key)
+        if not session:
+            return empty
+        if peer_label not in ("user", "hermes"):
+            logger.debug("fetch_distillations_for_peer: unknown peer_label %r", peer_label)
+            return empty
+
+        if peer_label == "user":
+            observer = session.user_peer_id
+            observed = session.user_peer_id
+            max_per_level = self._distillation_max_per_level_user
+        else:  # "hermes"
+            observer = session.assistant_peer_id
+            observed = session.user_peer_id
+            max_per_level = self._distillation_max_per_level_ai
+
+        try:
+            from .client import fetch_distillations
+        except Exception as e:
+            logger.debug("fetch_distillations import failed: %s", e)
+            return empty
+
+        try:
+            return fetch_distillations(
+                self._honcho,
+                self._config.workspace_id if self._config else "hermes",
+                observer=observer,
+                observed=observed,
+                max_deductive=self._distillation_max_deductive,
+                max_inductive=max_per_level,
+                max_contradictions=self._distillation_max_contradictions,
+            )
+        except Exception as e:
+            logger.debug("fetch_distillations_for_peer(%s) failed: %s", peer_label, e)
+            return empty
+
+    @staticmethod
+    def build_distillation_block(
+        distillations: dict[str, list[dict[str, Any]]],
+        peer_label: str,
+    ) -> str:
+        """Render a <distillations peer="..."> block in the locked XML shape.
+
+        Order inside the block (locked, see plan §P2.2 / honcho-reasoning-
+        engagement.md Q2-Q3): contradictions → deductive → inductive.
+        Sub-blocks are skipped when empty.  Returns the empty string when
+        all three levels are empty (caller can then skip emitting anything).
+        """
+        if not distillations or not any(distillations.values()):
+            return ""
+
+        parts: list[str] = [f'<distillations peer="{peer_label}">']
+        for tag_key, tag_name in (
+            ("contradictions", "contradictions"),
+            ("deductive", "deductive"),
+            ("inductive", "inductive"),
+        ):
+            items = distillations.get(tag_key) or []
+            if not items:
+                continue
+            parts.append(f"  <{tag_name}>")
+            for item in items:
+                content = (item.get("content") or "").strip()
+                if not content:
+                    continue
+                # Collapse internal newlines so each entry is one bullet line.
+                flat = " ".join(content.split())
+                parts.append(f"    - {flat}")
+            parts.append(f"  </{tag_name}>")
+        parts.append("</distillations>")
+        return "\n".join(parts)
+
     def dialectic_query(
         self, session_key: str, query: str,
         reasoning_level: str | None = None,
@@ -564,6 +736,17 @@ class HonchoSessionManager:
             level = reasoning_level
         else:
             level = self._default_reasoning_level()
+
+        # ----- Tier 3a (honcho-tuned v1.0.0): client-side query templating --
+        # Shape the user-facing question with a level-aware template before
+        # sending it to peer.chat().  This does NOT override Honcho's
+        # server-side dialectic system prompt (which is hardcoded in
+        # /app/src/dialectic/prompts.py on the Honcho server) — but it does
+        # give the model a richer, level-aware question to answer.  Apply
+        # AFTER the input-char truncation above so the template doesn't get
+        # cut off; the templated string itself stays well within budget
+        # since it only adds a short prefix/wrapper.
+        query = self._apply_dialectic_template(query, level=level, peer=peer)
 
         try:
             if self._ai_observe_others:
@@ -673,6 +856,29 @@ class HonchoSessionManager:
             result["ai_card"] = "\n".join(ai_ctx["card"])
         except Exception as e:
             logger.debug("Failed to fetch AI peer context from Honcho: %s", e)
+
+        # ----- Tier 1 (honcho-tuned v1.0.0): distillation block -------------
+        # Fetch both peer-perspectives so the prefetch returns everything
+        # the formatter needs in one network round-trip-window.  Each call
+        # internally swallows exceptions, so a failure on one perspective
+        # never blocks the other.  The plugin's _format_first_turn_context()
+        # renders these as <distillations peer="..."> blocks at the top of
+        # the memory-context (Q1 symmetric, Q2 position=top).
+        if self._distillation_enabled:
+            try:
+                user_distill = self.fetch_distillations_for_peer(session_key, "user")
+                user_block = self.build_distillation_block(user_distill, "user")
+                if user_block:
+                    result["distillations_user"] = user_block
+            except Exception as e:
+                logger.debug("user distillation fetch/render failed: %s", e)
+            try:
+                ai_distill = self.fetch_distillations_for_peer(session_key, "hermes")
+                ai_block = self.build_distillation_block(ai_distill, "hermes")
+                if ai_block:
+                    result["distillations_hermes"] = ai_block
+            except Exception as e:
+                logger.debug("hermes distillation fetch/render failed: %s", e)
 
         return result
 

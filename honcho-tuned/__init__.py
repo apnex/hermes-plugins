@@ -234,12 +234,12 @@ class HonchoMemoryProvider(MemoryProvider):
 
     @property
     def name(self) -> str:
-        return "honcho"
+        return "honcho-tuned"
 
     def is_available(self) -> bool:
         """Check if Honcho is configured. No network calls."""
         try:
-            from plugins.memory.honcho.client import HonchoClientConfig
+            from .client import HonchoClientConfig
             cfg = HonchoClientConfig.from_global_config()
             # Port #2645: baseUrl-only verification — api_key OR base_url suffices
             return cfg.enabled and bool(cfg.api_key or cfg.base_url)
@@ -269,7 +269,7 @@ class HonchoMemoryProvider(MemoryProvider):
     def post_setup(self, hermes_home: str, config: dict) -> None:
         """Run the full Honcho setup wizard after provider selection."""
         import types
-        from plugins.memory.honcho.cli import cmd_setup
+        from .cli import cmd_setup
         cmd_setup(types.SimpleNamespace())
 
     def initialize(self, session_id: str, **kwargs) -> None:
@@ -289,8 +289,8 @@ class HonchoMemoryProvider(MemoryProvider):
                 self._cron_skipped = True
                 return
 
-            from plugins.memory.honcho.client import HonchoClientConfig, get_honcho_client
-            from plugins.memory.honcho.session import HonchoSessionManager
+            from .client import HonchoClientConfig, get_honcho_client
+            from .session import HonchoSessionManager
 
             cfg = HonchoClientConfig.from_global_config()
             if not cfg.enabled or not (cfg.api_key or cfg.base_url):
@@ -351,8 +351,8 @@ class HonchoMemoryProvider(MemoryProvider):
 
     def _do_session_init(self, cfg, session_id: str, **kwargs) -> None:
         """Shared session initialization logic for both eager and lazy paths."""
-        from plugins.memory.honcho.client import get_honcho_client
-        from plugins.memory.honcho.session import HonchoSessionManager
+        from .client import get_honcho_client
+        from .session import HonchoSessionManager
 
         client = get_honcho_client(cfg)
         self._manager = HonchoSessionManager(
@@ -466,33 +466,134 @@ class HonchoMemoryProvider(MemoryProvider):
             return False
 
     def _format_first_turn_context(self, ctx: dict) -> str:
-        """Format the prefetch context dict into a readable system prompt block."""
-        parts = []
+        """Format the prefetch context dict into a readable system prompt block.
 
-        # Session summary — session-scoped context, placed first for relevance
-        summary = ctx.get("summary", "")
-        if summary:
-            parts.append(f"## Session Summary\n{summary}")
+        Locked order (Q2): peer_card → distillations[user] → distillations[hermes]
+        → representation → ai_representation → summary.
 
-        rep = ctx.get("representation", "")
-        if rep:
-            parts.append(f"## User Representation\n{rep}")
+        Truncation policy (Q3): when the assembled block exceeds the
+        configured context_tokens budget, sections are trimmed in this
+        order until the result fits — representation/ai_representation,
+        summary, distillations[hermes] inductive tail, distillations[user]
+        inductive tail, then distillations[*] deductive tail.
+        Contradictions and peer_card are NEVER trimmed.
+        """
+        # ----- Build labelled sections in locked order (Q2) -----------------
+        # Each entry: (label, text, trim_priority).  trim_priority drives
+        # Q3 budget enforcement: lower = trim first, 0 = never trim.
+        # 0 = keep always (cards, contradictions)
+        # 1 = trim first  (representation, ai_representation)
+        # 2 = trim second (summary)
+        # 3 = trim third  (inductive tails — hermes then user)
+        # 4 = trim fourth (deductive tails — hermes then user)
+        sections: list[tuple[str, str, int]] = []
 
         card = ctx.get("card", "")
         if card:
-            parts.append(f"## User Peer Card\n{card}")
-
-        ai_rep = ctx.get("ai_representation", "")
-        if ai_rep:
-            parts.append(f"## AI Self-Representation\n{ai_rep}")
+            sections.append(("peer_card_user", f"## User Peer Card\n{card}", 0))
 
         ai_card = ctx.get("ai_card", "")
         if ai_card:
-            parts.append(f"## AI Identity Card\n{ai_card}")
+            sections.append(("peer_card_ai", f"## AI Identity Card\n{ai_card}", 0))
 
-        if not parts:
+        distill_user = ctx.get("distillations_user", "")
+        if distill_user:
+            sections.append(("distillations_user", distill_user, 0))
+
+        distill_hermes = ctx.get("distillations_hermes", "")
+        if distill_hermes:
+            sections.append(("distillations_hermes", distill_hermes, 0))
+
+        rep = ctx.get("representation", "")
+        if rep:
+            sections.append(("representation", f"## User Representation\n{rep}", 1))
+
+        ai_rep = ctx.get("ai_representation", "")
+        if ai_rep:
+            sections.append(("ai_representation", f"## AI Self-Representation\n{ai_rep}", 1))
+
+        summary = ctx.get("summary", "")
+        if summary:
+            sections.append(("summary", f"## Session Summary\n{summary}", 2))
+
+        if not sections:
             return ""
-        return "\n\n".join(parts)
+
+        return self._enforce_section_budget(sections)
+
+    def _enforce_section_budget(self, sections: list[tuple[str, str, int]]) -> str:
+        """Assemble ``sections`` into a single string under context_tokens.
+
+        Implements the Q3 truncation policy: drop or trim in order
+        (1) representation/ai_representation, (2) summary, (3) inductive
+        tails of distillation blocks, (4) deductive tails.  Contradictions
+        and peer_cards (trim_priority=0) are NEVER touched.
+
+        No-op when ``context_tokens`` is unset.
+        """
+        joiner = "\n\n"
+        full = joiner.join(text for _, text, _ in sections)
+        if not self._config or not self._config.context_tokens:
+            return full
+
+        budget_chars = self._config.context_tokens * 4  # ~4 chars/token
+        if len(full) <= budget_chars:
+            return full
+
+        # ----- Step 1+2: drop priority-1 then priority-2 sections wholesale -
+        for drop_priority in (1, 2):
+            sections = [s for s in sections if s[2] != drop_priority]
+            full = joiner.join(text for _, text, _ in sections)
+            if len(full) <= budget_chars:
+                return full
+
+        # ----- Step 3+4: trim distillation tails inductive→deductive --------
+        # Drop tail entries from each distillation block in turn until the
+        # whole context fits.  Hermes block trims before user block to keep
+        # the user's own self-observations more prominent.
+        for label_target in ("distillations_hermes", "distillations_user"):
+            for tail_tag in ("inductive", "deductive"):
+                idx = next(
+                    (i for i, s in enumerate(sections) if s[0] == label_target),
+                    None,
+                )
+                if idx is None:
+                    continue
+                trimmed = self._trim_distillation_tail(sections[idx][1], tail_tag)
+                sections[idx] = (sections[idx][0], trimmed, sections[idx][2])
+                full = joiner.join(text for _, text, _ in sections)
+                if len(full) <= budget_chars:
+                    return full
+
+        # ----- Fallback: hard char-cut on whatever remains ------------------
+        if len(full) > budget_chars:
+            truncated = full[:budget_chars]
+            last_space = truncated.rfind(" ")
+            if last_space > budget_chars * 0.8:
+                truncated = truncated[:last_space]
+            return truncated + " …"
+        return full
+
+    @staticmethod
+    def _trim_distillation_tail(block: str, sub_tag: str) -> str:
+        """Remove the entire ``<sub_tag>...</sub_tag>`` sub-block from a
+        rendered <distillations> block.  Used by Q3 budget enforcement to
+        drop inductive/deductive tails while preserving contradictions.
+        Returns the original block unchanged if the sub-tag is absent.
+        """
+        open_tag = f"  <{sub_tag}>"
+        close_tag = f"  </{sub_tag}>"
+        start = block.find(open_tag)
+        if start < 0:
+            return block
+        end = block.find(close_tag, start)
+        if end < 0:
+            return block
+        end += len(close_tag)
+        # Also drop the trailing newline so we don't leave a blank line.
+        if end < len(block) and block[end] == "\n":
+            end += 1
+        return block[:start] + block[end:]
 
     def system_prompt_block(self) -> str:
         """Return system prompt text, adapted by recall_mode.
