@@ -677,17 +677,36 @@ class HonchoMemoryProvider(MemoryProvider):
         # ----- Layer 1: Base context (representation + card) -----
         # On first call, fetch synchronously so turn 1 isn't empty.
         # After that, serve from cache and refresh in background on cadence.
+        #
+        # CACHE-EMPTY-POISONING FIX (v1.0.1):
+        # The previous logic cached an empty string ("") when the very first
+        # synchronous fetch returned no data (e.g. peers not yet provisioned,
+        # Honcho deriver still warming up, transient HTTP failure).  Because
+        # the cache-miss check is ``is None`` (not ``not``), an empty-string
+        # cache value counted as a hit and prevented every subsequent turn
+        # from ever retrying — so distillations and peer cards stayed absent
+        # for the entire session.  Now we only persist NON-EMPTY results
+        # into the cache, leaving it ``None`` (retry-eligible) when the
+        # fetch produced nothing useful.
         with self._base_context_lock:
             if self._base_context_cache is None:
-                # First call — synchronous fetch
+                # First call (or prior fetch returned empty) — synchronous fetch
                 try:
                     ctx = self._manager.get_prefetch_context(self._session_key)
-                    self._base_context_cache = self._format_first_turn_context(ctx) if ctx else ""
-                    self._last_context_turn = self._turn_count
+                    formatted = self._format_first_turn_context(ctx) if ctx else ""
+                    if formatted:
+                        self._base_context_cache = formatted
+                        self._last_context_turn = self._turn_count
+                    else:
+                        # Leave cache as None so next turn re-fetches.
+                        # Use local empty string for THIS turn only.
+                        formatted = ""
                 except Exception as e:
                     logger.debug("Honcho base context fetch failed: %s", e)
-                    self._base_context_cache = ""
-            base_context = self._base_context_cache
+                    formatted = ""
+                base_context = formatted
+            else:
+                base_context = self._base_context_cache
 
         # Check if background context prefetch has a fresher result
         if self._manager:
